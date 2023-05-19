@@ -10,17 +10,17 @@ from scipy.signal import savgol_filter
 
 import multiprocessing as mul
 
-import matplotlib.pyplot as plt
-import bokeh.plotting  as bkp
+# import matplotlib.pyplot as plt
+# import bokeh.plotting  as bkp
 
 from pyLIMA import event
 from pyLIMA import telescopes
 from pyLIMA.fits import MCMC_fit
+from pyLIMA.fits import DE_fit
 from pyLIMA.models import PSPL_model
-from astropy.coordinates import SkyCoord
-from astropy import units as u
+
 from pyLIMA.outputs import pyLIMA_plots
-from pyLIMA.outputs import file_outputs as pyLIMA_fo
+# from pyLIMA.outputs import file_outputs as pyLIMA_fo
 
 import module_grab_data as mgd
 import module_toolbox as mt
@@ -56,8 +56,14 @@ ztfal_known = pd.read_csv(fin, header=0)
 # Exclude KMTNet events
 kmtnet_exclusion_zone = mt.exclude_KMTNet_fields(gsa_events["#Name"], gsa_events["Ra_deg"], gsa_events["Dec_deg"])
 
+# Create a file with all of the best solution
+all_sols_output = "OMEGA2_MCMC_test_best_solutions.csv"
+all = open(all_sols_output, "w")
+all.write("#t_0,u_0,t_E,pi_EN,pi_EE,F_s,F_b\n")
+all.close()
+
 #Time to run the loop...
-for idx in range(0,20): #len(gsa_events["#Name"])):
+for idx in range(0, slen(gsa_events["#Name"])):
     name = gsa_events["#Name"].values[idx]
     ra, dec = gsa_events["Ra_deg"].values[idx], gsa_events["Dec_deg"].values[idx]
     log.write("-----------------------------------------------------------------\n")
@@ -251,7 +257,6 @@ for idx in range(0,20): #len(gsa_events["#Name"])):
                                   mags.reshape(len(times),1),
                                   errs.reshape(len(times),1)))
 
-            fup_name = band.split('(')
             fup_name = "FUP_%s_%s" % (band[0],
                                       band.split("(")[1][:-1])
             telescope_fup = telescopes.Telescope(name=fup_name,
@@ -274,30 +279,51 @@ for idx in range(0,20): #len(gsa_events["#Name"])):
     guess = [t0guess, u0guess, 30]
     pspl = PSPL_model.PSPLmodel(gaia_event, parallax=['Full', t0guess])
 
-    # Time to start saving the outputs
-    output_path = "outputs/%s" % (name)
-    pathExist = os.path.exists(output_path)
-    if not pathExist:
-        os.makedirs(output_path)
-    # test before start
-    plot_start = pyLIMA_plots.plot_lightcurves(pspl, guess)
-    # save figure
-    plot_start[0].savefig('%s/%s_start.png' % (output_path, name),
-                          format="png")
     # # save bokeh plot
     # bkp.output_file(filename="%s/%s_start.html" % (path, name),
     #             title="%s starting plot" % (name))
     # bkp.save(plot_start[1])
 
     # Time to start fitting...
+    log.write("%s : %s : Setting up initial DE fit.\n" % (datetime.utcnow(), name))
+    fit_init = DE_fit.DEfit(pspl)
+
+    # boundries for DE, can be adjusted
+    fit_init.fit_parameters["t0"][1] = [t0guess - delta_t0, t0guess + delta_t0]
+    fit_init.fit_parameters["u0"][1] = [-2., 2.]
+    fit_init.fit_parameters["tE"][1] = [3., 3000.]
+    fit_init.fit_parameters["piEE"][1] = [-2, 2.]
+    fit_init.fit_parameters["piEN"][1] = [-2, 2.]
+
+    # starting fit
+    pool = mul.Pool(processes=7)
+    log.write("%s : %s : Initial DE start.\n" % (datetime.utcnow(), name))
+    t_start = time.time()
+    fit_init.fit(computational_pool=pool)
+    t_end = time.time()
+    log.write("%s : %s : Initial DE end, fitting took %.2f seconds.\n" % (datetime.utcnow(), name, t_end - t_start))
+
+    init_guess = fit_init.fit_results['best_model']
+    # Time to start saving the outputs
+    output_path = "outputs_MCMC/%s" % (name)
+    pathExist = os.path.exists(output_path)
+    if not pathExist:
+        os.makedirs(output_path)
+    # test before start
+    plot_start = pyLIMA_plots.plot_lightcurves(pspl, init_guess)
+    # save figure
+    plot_start[0].savefig('%s/%s_start.png' % (output_path, name),
+                          format="png")
+
     log.write("%s : %s : Setting up MCMC.\n" % (datetime.utcnow(), name))
     fit_gaia = MCMC_fit.MCMCfit(pspl)
 
     # starting point, can be adjusted
-    fit_gaia.model_parameters_guess = [t0guess, u0guess, 60, 0.1, 0.1]
+    fit_gaia.model_parameters_guess = init_guess
+    t0init = init_guess[0]
 
     # boundries for MCMC, can be adjusted
-    fit_gaia.fit_parameters["t0"][1] = [t0guess - delta_t0, t0guess + delta_t0]
+    fit_gaia.fit_parameters["t0"][1] = [t0init - delta_t0, t0init + delta_t0]
     fit_gaia.fit_parameters["u0"][1] = [-2., 2.]
     fit_gaia.fit_parameters["tE"][1] = [3., 3000.]
     fit_gaia.fit_parameters["piEE"][1] = [-2, 2.]
@@ -340,9 +366,19 @@ for idx in range(0,20): #len(gsa_events["#Name"])):
 
     # pyLIMA_fo.pdf_output(fit_gaia, output_path)
 
+    # Corner plots for samples and blends
+    corner_samp, corner_blend = mt.create_cornerplot_MCMC(samples_without_ln_like, blend_result)
+    corner_samp.savefig('%s/%s_corner_samples.pdf' % (output_path, name), format="pdf")
+    corner_blend.savefig('%s/%s_corner_blend.pdf' % (output_path, name), format="pdf")
+
     # Save best solution
     best_output = "%s/%s_best_solution.txt" % (output_path, name)
-    mt.save_best_sol(best_output, name, pspl, fit_gaia.fit_results['best_model'])
+    best_sol, fs_g, fb_g = mt.save_best_sol(best_output, name, pspl,
+                                            fit_gaia.fit_results['best_model'],
+                                            fit_gaia.fit_results['ln(likelihood)'])
+
+    # Save best solution to a csv file with all solutions
+    mt.save_best_sol_csv(all_sols_output, name, best_sol, fs_g, fb_g)
 
     # Finally, we're done with this event. Time to commemorate it in the log...
     log.write("%s : Procedure for %s ended.\n" % (datetime.utcnow(), name))
